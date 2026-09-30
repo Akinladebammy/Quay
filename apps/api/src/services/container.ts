@@ -65,6 +65,7 @@ import type { StellarTomlConfig } from "../routes/well-known";
 import { CircuitBreakerOffRamp } from "./circuit-breaker";
 import { WebhookWorker } from "../worker/webhook-worker";
 import { assertKeyConfigured } from "./secret-crypto";
+import { runKycRetentionSweep } from "./kyc-retention";
 
 export interface Container {
   service: LinkService;
@@ -281,6 +282,7 @@ export async function createContainer(): Promise<Container> {
 
   let stopPoller: (() => void) | null = null;
   let stopRevocationSweep: (() => void) | null = null;
+  let stopRetentionSweep: (() => void) | null = null;
   let stopProbe: (() => void) | null = null;
 
   return {
@@ -336,12 +338,28 @@ export async function createContainer(): Promise<Container> {
         60 * 60 * 1000, // hourly — revocation rows are cheap and self-limiting (max 24h lifetime) anyway
       );
       stopRevocationSweep = () => clearInterval(sweepTimer);
+
+      if (env.kycRetentionDays > 0) {
+        const sweepKyc = () => {
+          void runKycRetentionSweep({
+            db,
+            retentionDays: env.kycRetentionDays,
+            logger,
+          }).catch((err) => {
+            logger.error({ err }, "kyc retention sweep error");
+          });
+        };
+        // Daily sweep interval (24 hours)
+        const retentionTimer = setInterval(sweepKyc, 24 * 60 * 60 * 1000);
+        stopRetentionSweep = () => clearInterval(retentionTimer);
+      }
     },
     async stop() {
       await loop.stop();
       webhookWorker.stop();
       stopPoller?.();
       stopRevocationSweep?.();
+      stopRetentionSweep?.();
       if (watcher instanceof StreamingHorizonWatcher) watcher.stop();
       stopProbe?.();
       stopPoller = null;

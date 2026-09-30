@@ -283,6 +283,10 @@ export const env = {
   // and "none" has no KYC lifecycle to store PII for.
   kycEncryptionKey:
     offramp === "testanchor" || offramp === "anchor" ? req("KYC_ENCRYPTION_KEY") : undefined,
+  // Retention window (days) for inactive seller KYC & identity data (NDPA compliance).
+  // Purges seller KYC and payout fields after N days without activity. Default 730 (2 years).
+  // Set to 0 to disable the retention purge.
+  kycRetentionDays: num("KYC_RETENTION_DAYS", 730),
   // E2E harness mode (issue 5.7). "1" makes the API runnable with no network:
   // the ledger watcher never starts, the link-creation Horizon preflight is
   // skipped, and /__test__ routes are mounted that can mint a session and
