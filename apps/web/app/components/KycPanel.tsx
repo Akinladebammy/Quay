@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useEffect } from "react";
 import { api, CheckoutError, describeError, type AnchorAuthView, type KycView } from "../../lib/api";
 import { useAnchorConnect } from "../../lib/anchor-session";
@@ -261,6 +262,11 @@ export default function KycPanel({
         {submitting ? "Submitting…" : "Submit"}
       </button>
       {error && <div className="err">{error}</div>}
+      <p style={{ marginTop: 16, fontSize: 12, color: "var(--text-2, #6b7280)", textAlign: "center" }}>
+        By submitting, you consent to share the above fields with the anchor. See our
+        <Link href="/privacy" style={{ color: "var(--blue)" }}>Privacy Notice</Link>
+        for details on how your data is processed and your rights.
+      </p>
 
       {existingConsents.length > 0 && (
         <details style={{ marginTop: 16 }}>
