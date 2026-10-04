@@ -1,6 +1,7 @@
 import type { Context, Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import type { Logger } from "@checkout/core";
+import { loggablePath } from "./request-context";
 
 /**
  * Last-resort handler for anything a route did not catch.
@@ -23,7 +24,7 @@ export function installErrorHandler(app: Hono<any>, logger: Logger): void {
         event: "unhandled.error",
         requestId,
         method: ctx.req.method,
-        path: ctx.req.path,
+        path: loggablePath(ctx.req.path),
         errorName: err instanceof Error ? err.name : typeof err,
         error: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,

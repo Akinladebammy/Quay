@@ -37,7 +37,7 @@ export interface Sep12CustomerResult {
   staleCustomerId?: boolean;
 }
 
-function toFieldSpecs(fields: Record<string, RawFieldSpec> | undefined): KycFieldSpec[] {
+export function toFieldSpecs(fields: Record<string, RawFieldSpec> | undefined): KycFieldSpec[] {
   if (!fields) return [];
   return Object.entries(fields).map(([name, spec]) => ({
     name,
@@ -48,7 +48,7 @@ function toFieldSpecs(fields: Record<string, RawFieldSpec> | undefined): KycFiel
   }));
 }
 
-function toProvidedFieldStatus(fields: Record<string, RawProvidedField> | undefined): ProvidedFieldStatus[] {
+export function toProvidedFieldStatus(fields: Record<string, RawProvidedField> | undefined): ProvidedFieldStatus[] {
   if (!fields) return [];
   return Object.entries(fields).map(([name, spec]) => ({
     name,
@@ -57,7 +57,7 @@ function toProvidedFieldStatus(fields: Record<string, RawProvidedField> | undefi
   }));
 }
 
-function toKycStatus(status: string): KycStatus {
+export function toKycStatus(status: string): KycStatus {
   // ACCEPTED / REJECTED / NEEDS_INFO / PROCESSING are the SEP-12 statuses we
   // model; anything else (e.g. NEEDS_VERIFICATION) is treated as PROCESSING —
   // still not cleared to cash out, but not a hard rejection either.
@@ -139,6 +139,28 @@ export async function putSep12Customer(
   }
   const body = (await res.json()) as { id: string };
   return { customerId: body.id };
+}
+
+/**
+ * Registers a callback URL with the anchor for asynchronous SEP-12 status push updates.
+ * (SEP-12: PUT [KYC_SERVER]/customer/callback)
+ */
+export async function putSep12Callback(
+  kycServer: string,
+  jwt: string,
+  params: { customerId?: string | null; url: string },
+): Promise<void> {
+  const res = await fetch(endpointUrl(kycServer, "customer/callback"), {
+    method: "PUT",
+    headers: { "content-type": "application/json", authorization: `Bearer ${jwt}` },
+    body: JSON.stringify({
+      url: params.url,
+      ...(params.customerId ? { id: params.customerId } : {}),
+    }),
+  });
+  if (!res.ok) {
+    throw await anchorHttpError("12", "customer callback PUT", res);
+  }
 }
 
 /** Ask one anchor to erase the authenticated seller's SEP-12 customer data. */
