@@ -51,10 +51,17 @@ export interface WebhookDelivery {
   createdAt: number;
 }
 
+export interface OfframpPollStatus {
+  reason: string;
+  message: string;
+  at: number;
+}
+
 export interface LinkDetail {
   link: PaymentLink;
   request: PaymentRequest;
   deliveries: WebhookDelivery[];
+  offrampPoll?: OfframpPollStatus | null;
   /** Raw upstream status from offramp_jobs.external_status (e.g. SEP-24 "incomplete"). Null when no job ran yet. */
   offrampExternalStatus: string | null;
 }
