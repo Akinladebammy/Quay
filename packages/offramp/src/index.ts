@@ -6,3 +6,4 @@ export * from "./sep6";
 export * from "./sep1";
 export { deleteSep12Customer } from "./sep12";
 export * from "./anchor-session";
+export * from "./anchor-error";
