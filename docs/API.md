@@ -604,6 +604,50 @@ bank/routing info only — it is never used as a source of identity data.
 
 ---
 
+## `GET /links/:id/cash-out/transfer`
+
+**Requires auth** and the `offramp:initiate` scope (404 if the link belongs to a
+different seller). Returns the non-custodial transfer instructions for an
+`offramp_pending` link, so the seller can finish a withdrawal whose send step was
+lost (modal closed, tab reloaded, wallet popup failed). Called when the seller
+clicks "Send USDC to finish cash-out" on the dashboard or the link page, never
+from the dashboard refresh loop. Quay only relays the instructions; the payment
+is built and signed in the seller's browser.
+
+The instructions are read from the anchor with the seller's own session. If the
+anchor cannot be reached right now (offline, circuit breaker open), the copy
+stored the last time it answered is returned instead.
+
+**200**
+```json
+{
+  "transfer": {
+    "destination": "GANCHOR...",
+    "amount": "10.5",
+    "asset": { "code": "USDC", "issuer": "GA5Z..." },
+    "memo": "4242",
+    "memoType": "id"
+  }
+}
+```
+`asset` is the asset the withdrawal was quoted for (stored on the job), not
+something the anchor's transaction response names. `amount` is the anchor's
+`amount_in` when it states one, otherwise the quoted sell amount.
+
+**404** — `{ "error": "not_found" }`: another seller's link, an unknown link, or
+the anchor has not published instructions yet (a SEP-6 anchor still reviewing
+KYC).
+**409** — the link is not `offramp_pending`.
+**403** — `{ "error": "anchor_auth_required" }`: the seller has no live anchor
+session; reconnect from the Identity panel.
+
+Sending twice is two payments: the anchor credits the withdrawal once and the
+second transfer would need a manual refund. The web client therefore remembers
+the hash of a completed send for the browser session and shows "Payment sent,
+waiting for the anchor to see it" instead of the send button.
+
+---
+
 ## `/seller/anchor-auth`
 
 **Requires auth** and the `offramp:initiate` scope. The seller's own SEP-10

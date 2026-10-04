@@ -280,11 +280,18 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
       log.warn({ event: "cashout.transfer.rejected", linkId }, "cash-out transfer rejected: not the link's seller");
       return ctx.json({ error: "not_found" }, 404);
     }
-    const transfer = await c.service.getCashOutTransfer(linkId, { logger: log });
-    if (!transfer) {
-      return ctx.json({ error: "not_found" }, 404);
+    try {
+      const transfer = await c.service.getCashOutTransfer(linkId, { logger: log });
+      if (!transfer) {
+        return ctx.json({ error: "not_found" }, 404);
+      }
+      return ctx.json({ transfer });
+    } catch (err) {
+      // 409 when the link is not offramp_pending; 403 anchor_auth_required when
+      // the seller has no live anchor session.
+      if (err instanceof HttpError) return ctx.json({ error: err.message, ...err.extra }, err.status as 403 | 404 | 409);
+      throw err;
     }
-    return ctx.json({ transfer });
   });
 
   // Link detail with webhook deliveries (for the seller's timeline page).

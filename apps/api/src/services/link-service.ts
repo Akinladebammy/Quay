@@ -1150,11 +1150,22 @@ export class LinkService {
    */
   async getCashOutTransfer(linkId: string, opts: ServiceCallOptions = {}): Promise<WithdrawTransfer | null> {
     const link = await this.deps.links.findById(linkId);
-    if (!link || !link.offrampJobId) return null;
+    if (!link) return null;
+    // Instructions only matter while the withdrawal is open. A link that was never
+    // cashed out, or whose payout already settled or failed, has nothing to send.
+    if (link.status !== "offramp_pending") {
+      throw new HttpError(409, `Link must be offramp_pending to fetch transfer instructions (is "${link.status}")`);
+    }
+    if (!link.offrampJobId) return null;
     try {
+      // Circuit breaker open: do not add load to a struggling anchor; the stored copy below answers.
+      if (!this.health.isAvailable()) throw new Error("anchor_unavailable");
       const job = await this.deps.offramp.status(link.offrampJobId, opts);
       return job.transfer ?? null;
     } catch (err) {
+      // No live anchor session for this seller: the seller has to reconnect, same
+      // as quoting a cash-out. Do not paper over it with a stored copy.
+      if (err instanceof AnchorAuthRequiredError) throw anchorAuthRequired();
       // The anchor could not be asked right now (offline, or the seller's session expired). Fall back to
       // what was stored the last time it answered rather than hide instructions the seller still needs.
       (opts.logger ?? this.deps.logger)?.warn(

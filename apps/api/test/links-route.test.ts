@@ -322,4 +322,22 @@ describe("GET /links/:id/cash-out/transfer — non-custodial transfer instructio
     expect(body.transfer.amount).toBe("10");
     expect(body.transfer.memo).toBe("test-memo");
   });
+
+  it.each([
+    [409, "Link must be offramp_pending to fetch transfer instructions"],
+    [403, "anchor_auth_required"],
+  ])("passes the service's %i through (not offramp_pending / no anchor session)", async (status, message) => {
+    const container = fakeContainer();
+    (container.service as unknown as Record<string, unknown>).getCashOutTransfer = async () => {
+      throw new HttpError(status, message);
+    };
+    const app = linkRoutes(container, async (_c, next) => next());
+    const token = await tokenFor(container.auth.session, owner.id);
+
+    const res = await app.request(`/${ownedLink.id}/cash-out/transfer`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(status);
+    expect(((await res.json()) as Record<string, unknown>).error).toBe(message);
+  });
 });

@@ -1305,3 +1305,132 @@ describe("LinkService cash-out — anchor rejections", () => {
     ).rejects.toMatchObject({ status: 409, message: "quote_mismatch" });
   });
 });
+
+describe("LinkService.getCashOutTransfer (resume an unsent transfer)", () => {
+  it("returns null for a nonexistent link", async () => {
+    const service = makeService({
+      links: new FakeLinkRepository([]),
+      offramp: new ScriptedOffRamp(),
+      offrampState: new FakeOffRampStateRepository(),
+    });
+    expect(await service.getCashOutTransfer("lnk_unknown")).toBeNull();
+  });
+
+  it("rejects 409 when link status is not offramp_pending", async () => {
+    const links = new FakeLinkRepository([makeLink({ id: "lnk_1", status: "paid" })]);
+    const service = makeService({
+      links,
+      offramp: new ScriptedOffRamp(),
+      offrampState: new FakeOffRampStateRepository(),
+    });
+    await expect(service.getCashOutTransfer("lnk_1")).rejects.toMatchObject({
+      status: 409,
+    });
+  });
+
+  it("returns null if link has no offrampJobId", async () => {
+    const links = new FakeLinkRepository([makeLink({ id: "lnk_1", status: "offramp_pending", offrampJobId: null })]);
+    const service = makeService({
+      links,
+      offramp: new ScriptedOffRamp(),
+      offrampState: new FakeOffRampStateRepository(),
+    });
+    const res = await service.getCashOutTransfer("lnk_1");
+    expect(res).toBeNull();
+  });
+
+  it("returns { transfer } from offramp status", async () => {
+    const links = new FakeLinkRepository([
+      makeLink({ id: "lnk_1", status: "offramp_pending", offrampJobId: "job_123" }),
+    ]);
+    const offramp = new ScriptedOffRamp();
+    offramp.statusImpl = async (jobId) => ({
+      jobId,
+      linkId: "lnk_1",
+      status: "pending",
+      targetCurrency: "NGN",
+      targetAmount: "16500",
+      rate: "1650",
+      transfer: {
+        destination: "GANCHOR",
+        amount: "10",
+        asset: { code: "USDC", issuer: "GISSUER" },
+        memo: "42",
+        memoType: "id",
+      },
+    });
+    const service = makeService({
+      links,
+      offramp,
+      offrampState: new FakeOffRampStateRepository(),
+    });
+    const res = await service.getCashOutTransfer("lnk_1");
+    expect(res).toEqual({
+      destination: "GANCHOR",
+      amount: "10",
+      asset: { code: "USDC", issuer: "GISSUER" },
+      memo: "42",
+      memoType: "id",
+    });
+  });
+
+  it("maps AnchorAuthRequiredError to 403 anchor_auth_required", async () => {
+    const links = new FakeLinkRepository([
+      makeLink({ id: "lnk_1", status: "offramp_pending", offrampJobId: "job_123" }),
+    ]);
+    const offramp = new ScriptedOffRamp();
+    offramp.statusImpl = async () => {
+      throw new AnchorAuthRequiredError("anchor.example");
+    };
+    const service = makeService({
+      links,
+      offramp,
+      offrampState: new FakeOffRampStateRepository(),
+    });
+    await expect(service.getCashOutTransfer("lnk_1")).rejects.toMatchObject({
+      status: 403,
+      message: "anchor_auth_required",
+    });
+  });
+
+  it("falls back to the stored instructions when the anchor cannot be reached", async () => {
+    const links = new FakeLinkRepository([
+      makeLink({ id: "lnk_1", status: "offramp_pending", offrampJobId: "job_123" }),
+    ]);
+    const offrampState = new FakeOffRampStateRepository();
+    const stored = {
+      destination: "GANCHOR",
+      amount: "10",
+      asset: { code: "USDC", issuer: "GISSUER" },
+      memo: "42",
+      memoType: "id" as const,
+    };
+    await offrampState.saveJob({
+      jobId: "job_123",
+      linkId: "lnk_1",
+      anchor: "testanchor",
+      status: "awaiting_transfer",
+      externalStatus: "pending_user_transfer_start",
+      targetCurrency: "NGN",
+      targetAmount: "16500",
+      rate: "1650",
+      sellerId: "sel_1",
+      account: "GSELLER",
+      createdAt: 1000,
+      updatedAt: 1000,
+      lastError: null,
+      lastPollError: null,
+      lastPollErrorAt: null,
+      lastPollReason: null,
+      transferNotifiedAt: null,
+      transfer: stored,
+    });
+    const offramp = new ScriptedOffRamp();
+    offramp.statusImpl = async () => {
+      throw new Error("ECONNRESET");
+    };
+    const service = makeService({ links, offramp, offrampState });
+    expect(await service.getCashOutTransfer("lnk_1")).toEqual(stored);
+  });
+});
+
