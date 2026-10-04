@@ -12,6 +12,7 @@ import { metricsRoutes } from "./routes/metrics";
 import { authRoutes } from "./routes/auth";
 import { wellKnownRoutes } from "./routes/well-known";
 import { kycRoutes } from "./routes/kyc";
+import { profileRoutes } from "./routes/profile";
 import { anchorAuthRoutes } from "./routes/anchor-auth";
 import { anchorCallbacksRoutes } from "./routes/anchor-callbacks";
 import { demoRoutes } from "./routes/demo";
@@ -200,6 +201,7 @@ async function main(): Promise<void> {
   );
   app.route("/.well-known", wellKnownRoutes(container.auth.stellarToml));
   app.route("/seller/kyc", kycRoutes(container));
+  app.route("/seller/profile", profileRoutes(container));
   app.route("/seller/anchor-auth", anchorAuthRoutes(container, anchorAuthLimit));
   app.use("/anchor-callbacks/*", anchorCallbackLimit);
   app.route("/anchor-callbacks", anchorCallbacksRoutes(container));
