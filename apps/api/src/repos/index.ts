@@ -32,6 +32,7 @@ import type {
   OffRampTelemetryStatus,
   OffRampTelemetrySummary,
   AssetRef,
+  WithdrawTransfer,
 } from "@checkout/core";
 import type { DB } from "../db/client";
 import {
@@ -922,6 +923,9 @@ function rowToJob(row: OffRampJobRow): StoredOffRampJob {
     status: row.status as StoredOffRampJob["status"],
     externalStatus: row.externalStatus ?? null,
     lastError: row.lastError ?? null,
+    sellAsset: row.sellAssetCode ? { code: row.sellAssetCode, issuer: row.sellAssetIssuer ?? null } : null,
+    sellAmount: row.sellAmount ?? null,
+    transfer: row.transferJson ? (JSON.parse(row.transferJson) as WithdrawTransfer) : null,
     lastPollError: row.lastPollError ?? null,
     lastPollErrorAt: row.lastPollErrorAt ?? null,
     lastPollReason: row.lastPollReason ?? null,
@@ -972,6 +976,10 @@ export class DrizzleOffRampStateRepository implements OffRampStateRepository {
       status: job.status,
       externalStatus: job.externalStatus,
       lastError: job.lastError,
+      sellAssetCode: job.sellAsset?.code ?? null,
+      sellAssetIssuer: job.sellAsset?.issuer ?? null,
+      sellAmount: job.sellAmount ?? null,
+      transferJson: job.transfer ? JSON.stringify(job.transfer) : null,
       lastPollError: job.lastPollError ?? null,
       lastPollErrorAt: job.lastPollErrorAt ?? null,
       lastPollReason: job.lastPollReason ?? null,
@@ -988,11 +996,18 @@ export class DrizzleOffRampStateRepository implements OffRampStateRepository {
 
   async updateJob(
     jobId: string,
-    patch: Partial<Pick<StoredOffRampJob, "targetAmount" | "status" | "externalStatus" | "lastError" | "transferNotifiedAt" | "lastPollError" | "lastPollErrorAt" | "lastPollReason">>,
+    patch: Partial<Pick<StoredOffRampJob, "targetAmount" | "status" | "externalStatus" | "lastError" | "transfer" | "transferNotifiedAt" | "lastPollError" | "lastPollErrorAt" | "lastPollReason">>,
   ): Promise<void> {
+    const { transfer, ...columns } = patch;
     await this.db
       .update(offrampJobs)
-      .set({ ...patch, updatedAt: Date.now() })
+      .set({
+        ...columns,
+        // `undefined` leaves the stored instructions alone; only an explicit
+        // value (or null) rewrites them.
+        ...(transfer !== undefined ? { transferJson: transfer ? JSON.stringify(transfer) : null } : {}),
+        updatedAt: Date.now(),
+      })
       .where(eq(offrampJobs.jobId, jobId));
   }
 }
