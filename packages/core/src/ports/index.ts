@@ -190,6 +190,7 @@ export interface OffRampJob {
    * wallet signs.
    */
   transfer?: WithdrawTransfer;
+  needsSellerAction?: boolean;
 }
 
 /**

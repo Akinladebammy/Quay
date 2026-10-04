@@ -72,11 +72,61 @@ export interface TestAnchorOptions {
   logger?: Logger;
 }
 
-function mapSep6Status(status: string): OffRampJobStatus {
-  if (status === "completed") return "settled";
-  if (status === "error" || status === "refunded" || status === "expired") return "failed";
-  if (status === "pending_user_transfer_start" || status === "incomplete") return "awaiting_transfer";
-  return "pending"; // pending_anchor, pending_external, ...
+type Sep6TransactionStatus =
+  | "pending_anchor"
+  | "pending_user_transfer_start"
+  | "pending_user_transfer_complete"
+  | "pending_external"
+  | "on_hold"
+  | "pending_stellar"
+  | "pending_trust"
+  | "pending_user"
+  | "pending_customer_info_update"
+  | "pending_transaction_info_update"
+  | "incomplete"
+  | "completed"
+  | "refunded"
+  | "expired"
+  | "error"
+  | "no_market"
+  | "too_small"
+  | "too_large";
+
+interface Sep6StatusMapping {
+  status: OffRampJobStatus;
+  /** Fallback failure reason when the anchor sends no `message`. */
+  reason?: string;
+  /** The anchor is waiting on the seller (not terminal; link state is unchanged). */
+  needsSellerAction?: boolean;
+}
+
+/** Explicit SEP-6 transaction-history status mapping. */
+export const SEP6_STATUS_MAP: Record<Sep6TransactionStatus, Sep6StatusMapping> = {
+  pending_anchor: { status: "pending" },
+  pending_user_transfer_start: { status: "awaiting_transfer" },
+  pending_user_transfer_complete: { status: "pending" },
+  pending_external: { status: "pending" },
+  on_hold: { status: "pending" },
+  pending_stellar: { status: "pending" },
+  pending_trust: { status: "pending" },
+  pending_user: { status: "pending" },
+  pending_customer_info_update: { status: "pending", needsSellerAction: true },
+  pending_transaction_info_update: { status: "pending", needsSellerAction: true },
+  incomplete: { status: "awaiting_transfer" },
+  completed: { status: "settled" },
+  refunded: { status: "failed", reason: "withdrawal was refunded (refunded)" },
+  expired: { status: "failed", reason: "withdrawal expired (expired)" },
+  error: { status: "failed", reason: "anchor reported an error (error)" },
+  no_market: { status: "failed", reason: "no market for the asset pair (no_market)" },
+  too_small: { status: "failed", reason: "amount below the anchor's limit (too_small)" },
+  too_large: { status: "failed", reason: "amount above the anchor's limit (too_large)" },
+};
+
+export function mapSep6Status(status: string): Sep6StatusMapping {
+  if (Object.hasOwn(SEP6_STATUS_MAP, status)) {
+    return SEP6_STATUS_MAP[status as Sep6TransactionStatus];
+  }
+  return { status: "pending" };
 }
 
 export class TestAnchorOffRamp implements OffRampPort {
@@ -87,6 +137,7 @@ export class TestAnchorOffRamp implements OffRampPort {
   private readonly homeDomain: string;
   private readonly state: OffRampStateRepository;
   private readonly logger: Logger;
+  private readonly unknownStatusesLogged = new Set<string>();
   /** Operator's chosen SEP-6 withdraw type; undefined means "infer, and refuse
    *  if the anchor offers more than one". See resolveWithdrawType. */
   private readonly preferredWithdrawType: string | undefined;
@@ -358,9 +409,15 @@ export class TestAnchorOffRamp implements OffRampPort {
     const child = baseLog.child({ jobId, linkId: job.linkId });
     const jwt = await this.auth.token({ sellerId: job.sellerId, account: job.account });
     const tx = await getSep6Transaction((await this.discover()).transferServer, jwt, jobId, baseLog);
-    const status = mapSep6Status(tx.status);
+    const mappedStatus = mapSep6Status(tx.status);
+    if (!Object.hasOwn(SEP6_STATUS_MAP, tx.status) && !this.unknownStatusesLogged.has(jobId)) {
+      this.unknownStatusesLogged.add(jobId);
+      child.warn({ event: "anchor.sep6.status.unknown", status: tx.status }, "unknown SEP-6 transaction status");
+    }
+    const status = mappedStatus.status;
     const targetAmount = tx.amountOut ?? job.targetAmount;
-    const reason = status === "failed" ? (tx.message ?? `${this.anchorName}: withdrawal failed`) : null;
+    const reason =
+      status === "failed" ? tx.message || mappedStatus.reason || `${this.anchorName}: withdrawal failed` : null;
 
     // SEP-6 lets the anchor leave the deposit instructions out of /withdraw and
     // publish them here, at pending_user_transfer_start. Without relaying them
@@ -402,6 +459,7 @@ export class TestAnchorOffRamp implements OffRampPort {
       rate: job.rate,
       reason: reason ?? undefined,
       ...(transfer ? { transfer } : {}),
+      ...(mappedStatus.needsSellerAction ? { needsSellerAction: true } : {}),
     };
   }
 }
