@@ -561,6 +561,9 @@ export const api = {
     ),
 
 
+  getCashOutTransfer: (id: string) =>
+    http<{ transfer: WithdrawTransfer }>(`/links/${id}/cash-out/transfer`),
+
   exportCsv: (from?: string, to?: string): Promise<Blob> => {
     const params = new URLSearchParams();
     if (from) params.set("from", from);
