@@ -824,6 +824,24 @@ describe("LinkService cash-out — the seller is the anchor's customer", () => {
     expect(job).toMatchObject({ sellerId: "sel_1", account: "GSELLER" });
   });
 
+  it("checks KYC at the cash-out gate without opting into the status cache", async () => {
+    const links = new FakeLinkRepository([makeLink({ status: "paid" })]);
+    const seenOpts: Array<{ maxAgeMs?: number } | undefined> = [];
+    const kyc = new ScriptedKyc();
+    kyc.statusImpl = async (customer, opts) => {
+      seenOpts.push(opts);
+      return new AlwaysAcceptedKyc().status(customer);
+    };
+    const offrampState = new FakeOffRampStateRepository();
+    const offramp = new MockAnchorOffRamp({ state: offrampState, settleAfterMs: 60_000 });
+    const service = makeService({ links, offramp, offrampState, kyc });
+
+    await service.triggerCashOut("lnk_1", { targetCurrency: "NGN", payoutFields: {} });
+
+    expect(seenOpts.length).toBeGreaterThan(0);
+    for (const opts of seenOpts) expect(opts?.maxAgeMs).toBeUndefined();
+  });
+
   it("answers 403 anchor_auth_required when the seller has not signed in to the anchor", async () => {
     const links = new FakeLinkRepository([makeLink({ status: "paid" })]);
     const kyc = new ScriptedKyc();

@@ -88,7 +88,7 @@ export interface Container {
   anchorAuth: SellerAnchorAuth | null;
   deleteAnchorCustomer?: ((customer: AnchorCustomer) => Promise<"deleted" | "not_found">) | null;
   telemetry: OffRampTelemetryRepository;
-  config: { network: string; horizonUrl: string; sellerWallet: string | null };
+  config: { network: string; horizonUrl: string; sellerWallet: string | null; kycStatusCacheMs?: number };
   horizonStatus(): HorizonStatus;
   /** Optional SSRF guard override for webhook URLs. Tests inject a permissive
    *  one so route tests do not depend on live DNS. */
@@ -316,7 +316,7 @@ export async function createContainer(): Promise<Container> {
       return deleteSep12Customer(kycServer, jwt, customer.account);
     } : null,
     telemetry: telemetryRepo,
-    config: { network: stellar.network, horizonUrl: stellar.horizonUrl, sellerWallet },
+    config: { network: stellar.network, horizonUrl: stellar.horizonUrl, sellerWallet, kycStatusCacheMs: env.kycStatusCacheMs },
     horizonStatus: () => pollingWatcher.getStatus(),
     metricsToken,
     watcherLagSeconds: () => loop.getLagSeconds(),

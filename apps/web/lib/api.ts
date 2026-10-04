@@ -582,7 +582,8 @@ export const api = {
     }),
 
   logout: () => http<{ ok: true }>("/auth/logout", { method: "POST" }).finally(() => setSessionToken(null)),
-  getKyc: () => http<KycView>("/seller/kyc"),
+  getKyc: (opts?: { refresh?: boolean }) =>
+    http<KycView>(`/seller/kyc${opts?.refresh ? "?refresh=1" : ""}`),
   getDisclosures: () => http<KycDisclosure[]>("/seller/kyc/disclosures"),
   deleteAnchorKyc: (anchorDomain: string) => http<{ anchorDomain: string; anchorResult: "deleted" | "not_found"; localDataErased: true }>(
     `/seller/kyc/disclosures/${encodeURIComponent(anchorDomain)}`, { method: "DELETE" },
