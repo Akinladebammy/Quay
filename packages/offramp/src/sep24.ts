@@ -1,8 +1,6 @@
-import type { Keypair } from "@stellar/stellar-sdk";
-import type { AssetRef } from "@checkout/core";
-import { Sep10Client } from "./sep10";
 import { anchorHttpError } from "./anchor-error";
-import { endpointUrl, fetchStellarToml, type Sep1DiscoveryInfo } from "./sep1";
+import type { AnchorDiscovery } from "./anchor-session";
+import { endpointUrl, type Sep1DiscoveryInfo } from "./sep1";
 
 export type { Sep1DiscoveryInfo };
 export { endpointUrl };
@@ -35,41 +33,19 @@ export interface Sep24Transaction {
   moreInfoUrl?: string;
 }
 
-function assetIdentifier(asset: AssetRef): string {
-  return asset.issuer === null ? "stellar:native" : `stellar:${asset.code}:${asset.issuer}`;
-}
-
+/**
+ * SEP-24 HTTP calls. It holds no key and signs nothing: every call takes the SELLER's anchor JWT
+ * (from `SellerAnchorAuth`, where the seller's own wallet signed the SEP-10 challenge).
+ */
 export class Sep24Client {
-  private authClient: Sep10Client | null = null;
-  private discoveryPromise: Promise<Sep1DiscoveryInfo> | null = null;
+  constructor(private readonly discovery: AnchorDiscovery) {}
 
-  constructor(
-    private readonly sellerKeypair: Keypair,
-    private readonly homeDomain: string,
-  ) {}
-
-  async getDiscoveryInfo(): Promise<Sep1DiscoveryInfo> {
-    if (!this.discoveryPromise) {
-      this.discoveryPromise = fetchStellarToml(this.homeDomain);
-    }
-    return this.discoveryPromise;
+  getDiscoveryInfo(): Promise<Sep1DiscoveryInfo> {
+    return this.discovery.get();
   }
 
-  private async getAuthToken(): Promise<string> {
+  async startInteractiveWithdraw(token: string, input: Sep24WithdrawInteractiveInput): Promise<Sep24InteractiveResult> {
     const discovery = await this.getDiscoveryInfo();
-    if (!this.authClient) {
-      this.authClient = new Sep10Client(this.sellerKeypair, {
-        baseUrl: discovery.webAuthEndpoint,
-        homeDomain: this.homeDomain,
-        signingKey: discovery.signingKey,
-      });
-    }
-    return this.authClient.token();
-  }
-
-  async startInteractiveWithdraw(input: Sep24WithdrawInteractiveInput): Promise<Sep24InteractiveResult> {
-    const discovery = await this.getDiscoveryInfo();
-    const token = await this.getAuthToken();
 
     const endpoint = endpointUrl(discovery.transferServerSep24, "transactions/withdraw/interactive");
 
@@ -106,9 +82,8 @@ export class Sep24Client {
     };
   }
 
-  async getTransaction(id: string): Promise<Sep24Transaction> {
+  async getTransaction(token: string, id: string): Promise<Sep24Transaction> {
     const discovery = await this.getDiscoveryInfo();
-    const token = await this.getAuthToken();
 
     const url = endpointUrl(discovery.transferServerSep24, "transaction");
     url.searchParams.set("id", id);

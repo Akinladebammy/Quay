@@ -1,8 +1,24 @@
 import { Keypair, Transaction, TransactionBuilder, WebAuth } from "@stellar/stellar-sdk";
 import type { Logger } from "@checkout/core";
 import { NOOP_LOGGER } from "@checkout/core";
-import { anchorHttpError } from "./anchor-error";
 
+// ===========================================================================
+//  TEST-ONLY SEP-10 client reference.
+// ===========================================================================
+// Issue #207 moved this out of `src/`. It signs an anchor's SEP-10 challenge
+// with a `Keypair` the caller supplies, which is exactly the design the
+// per-seller anchor identity fix removed from Quay: a runtime module holding a
+// key that logs in as a seller. It is not wrong for a *client* to do this — the
+// seller's wallet does it in production — but nothing that ships may import it,
+// so it lives beside the tests that exercise it and is not exported from
+// `packages/offramp/src/index.ts` (nor from the package's `exports` map).
+//
+// The runtime paths that must be used instead:
+//   - `anchor-session.ts` (`SellerAnchorAuth`) fetches and verifies the
+//     challenge, then relays the seller's wallet-signed transaction.
+//   - `apps/web/lib/wallet.ts` is the actual signer in production.
+// `scripts/check-no-server-signing.mjs` fails CI if a signing path reappears
+// under `packages/offramp/src` or `apps/api/src`.
 export interface Sep10Options {
   baseUrl: string;
   homeDomain: string;
@@ -77,7 +93,7 @@ export class Sep10Client {
     const challengeRes = await fetch(challengeUrl);
     if (!challengeRes.ok) {
       child.warn({ event: "anchor.sep10.challenge.fail", statusCode: challengeRes.status, durationMs: Date.now() - t0 }, "SEP-10 challenge failed");
-      throw await anchorHttpError("10", "challenge fetch", challengeRes);
+      throw new Error(`SEP-10 challenge fetch failed: ${challengeRes.status} ${await challengeRes.text()}`);
     }
     const { transaction, network_passphrase } = (await challengeRes.json()) as {
       transaction: string;
@@ -132,7 +148,7 @@ export class Sep10Client {
     });
     if (!authRes.ok) {
       child.warn({ event: "anchor.sep10.auth.fail", statusCode: authRes.status, durationMs: Date.now() - t1 }, "SEP-10 auth submit failed");
-      throw await anchorHttpError("10", "auth submit", authRes);
+      throw new Error(`SEP-10 auth submit failed: ${authRes.status} ${await authRes.text()}`);
     }
     const { token } = (await authRes.json()) as { token: string };
     const exp = decodeJwtExp(token);

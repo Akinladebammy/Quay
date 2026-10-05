@@ -1,11 +1,17 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Keypair } from "@stellar/stellar-sdk";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { AnchorOffRamp, mapSep24Status } from "../src/anchor";
+import type { AnchorDiscovery, SellerAnchorAuth } from "../src/anchor-session";
 import { parseStellarToml } from "../src/sep1";
 import { FakeOffRampStateRepository } from "./fake-state";
+
+const CUSTOMER = { sellerId: "seller-1", account: "GSELLERACCOUNT1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ" };
+// The adapter only needs a seller's JWT; the real SellerAnchorAuth (wallet-signed SEP-10) is covered in anchor-session.test.ts.
+const discovery = { homeDomain: "testanchor.stellar.org", get: async () => ({}) } as unknown as AnchorDiscovery;
+const auth = { token: async () => "seller-jwt" } as unknown as SellerAnchorAuth;
+const adapterOpts = { discovery, auth };
 
 const USDC_TESTNET_ISSUER = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
@@ -38,10 +44,8 @@ describe("AnchorOffRamp (offline)", () => {
 
   it("pending_user_transfer_start returns transfer instructions without signing on-chain, and survives new adapter instance", async () => {
     const state = new FakeOffRampStateRepository();
-    const sellerKeypair = Keypair.random();
-    const offramp = new AnchorOffRamp({
-      homeDomain: "testanchor.stellar.org",
-      sellerKeypair,
+        const offramp = new AnchorOffRamp({
+      ...adapterOpts,
       state,
     });
 
@@ -61,6 +65,8 @@ describe("AnchorOffRamp (offline)", () => {
       jobId: "job-1",
       linkId: "link-1",
       anchor: "testanchor.stellar.org",
+      sellerId: CUSTOMER.sellerId,
+      account: CUSTOMER.account,
       targetCurrency: "USD",
       targetAmount: "",
       rate: "1.00",
@@ -110,8 +116,7 @@ describe("AnchorOffRamp (offline)", () => {
 
     // Create a brand new adapter instance with same state (simulating restart)
     const freshOfframp = new AnchorOffRamp({
-      homeDomain: "testanchor.stellar.org",
-      sellerKeypair,
+      ...adapterOpts,
       state,
     });
 
@@ -131,10 +136,8 @@ describe("AnchorOffRamp (offline)", () => {
 
   it("fails the job if amount_in exceeds the quoted sellAmount", async () => {
     const state = new FakeOffRampStateRepository();
-    const sellerKeypair = Keypair.random();
-    const offramp = new AnchorOffRamp({
-      homeDomain: "testanchor.stellar.org",
-      sellerKeypair,
+        const offramp = new AnchorOffRamp({
+      ...adapterOpts,
       state,
     });
 
@@ -142,6 +145,8 @@ describe("AnchorOffRamp (offline)", () => {
       jobId: "job-over",
       linkId: "link-over",
       anchor: "testanchor.stellar.org",
+      sellerId: CUSTOMER.sellerId,
+      account: CUSTOMER.account,
       targetCurrency: "USD",
       targetAmount: "",
       rate: "1.00",
@@ -184,10 +189,8 @@ describe("AnchorOffRamp (offline)", () => {
 
   it("fails the job if amount_in is missing in pending_user_transfer_start", async () => {
     const state = new FakeOffRampStateRepository();
-    const sellerKeypair = Keypair.random();
-    const offramp = new AnchorOffRamp({
-      homeDomain: "testanchor.stellar.org",
-      sellerKeypair,
+        const offramp = new AnchorOffRamp({
+      ...adapterOpts,
       state,
     });
 
@@ -206,6 +209,8 @@ describe("AnchorOffRamp (offline)", () => {
       jobId: "job-no-amt",
       linkId: "link-no-amt",
       anchor: "testanchor.stellar.org",
+      sellerId: CUSTOMER.sellerId,
+      account: CUSTOMER.account,
       targetCurrency: "USD",
       targetAmount: "",
       rate: "1.00",
@@ -233,10 +238,8 @@ describe("AnchorOffRamp (offline)", () => {
 
   it("clears transfer once status advances past pending_user_transfer_start", async () => {
     const state = new FakeOffRampStateRepository();
-    const sellerKeypair = Keypair.random();
-    const offramp = new AnchorOffRamp({
-      homeDomain: "testanchor.stellar.org",
-      sellerKeypair,
+        const offramp = new AnchorOffRamp({
+      ...adapterOpts,
       state,
     });
 
@@ -244,6 +247,8 @@ describe("AnchorOffRamp (offline)", () => {
       jobId: "job-adv",
       linkId: "link-adv",
       anchor: "testanchor.stellar.org",
+      sellerId: CUSTOMER.sellerId,
+      account: CUSTOMER.account,
       targetCurrency: "USD",
       targetAmount: "100.00",
       rate: "1.00",
@@ -279,8 +284,7 @@ describe("AnchorOffRamp (offline)", () => {
   async function transferSetup(opts: { quote: boolean }) {
     const state = new FakeOffRampStateRepository();
     const offramp = new AnchorOffRamp({
-      homeDomain: "testanchor.stellar.org",
-      sellerKeypair: Keypair.random(),
+      ...adapterOpts,
       state,
     });
     if (opts.quote) {
@@ -299,8 +303,8 @@ describe("AnchorOffRamp (offline)", () => {
       jobId: "job-x",
       linkId: "link-x",
       anchor: "testanchor.stellar.org",
-      sellerId: null,
-      account: null,
+      sellerId: CUSTOMER.sellerId,
+      account: CUSTOMER.account,
       targetCurrency: "USD",
       targetAmount: "",
       rate: "1.00",
@@ -377,9 +381,22 @@ describe("AnchorOffRamp (offline)", () => {
     });
   });
 
+  it("runs every anchor call with the seller's own session JWT, and refuses a job that has no seller", async () => {
+    const { state, offramp } = await transferSetup({ quote: true });
+    const getTransaction = vi.spyOn(offramp["sep24"], "getTransaction").mockResolvedValue(tx());
+    const token = vi.spyOn(auth, "token");
+
+    await offramp.status("job-x");
+    expect(token).toHaveBeenCalledWith({ sellerId: CUSTOMER.sellerId, account: CUSTOMER.account });
+    expect(getTransaction).toHaveBeenCalledWith("seller-jwt", "job-x");
+
+    await state.updateJob("job-x", { sellerId: null, account: null });
+    await expect(offramp.status("job-x")).rejects.toThrow(/not found|unknown/i);
+  });
+
   it("requires a state repository: there is no in-memory default to lose on restart", () => {
     // @ts-expect-error `state` is a required option
-    const build = () => new AnchorOffRamp({ homeDomain: "testanchor.stellar.org", sellerKeypair: Keypair.random() });
+    const build = () => new AnchorOffRamp({ ...adapterOpts });
     expect(build).toThrow();
   });
 
@@ -402,42 +419,4 @@ describe("AnchorOffRamp (offline)", () => {
 
     expect(offenders).toEqual([]);
   });
-});
-
-describe.skipIf(!process.env.RUN_LIVE_ANCHOR_TESTS)("AnchorOffRamp (live)", () => {
-  it("quote(), initiate(), and status() execute SEP-24 flow against a live anchor", async () => {
-    const homeDomain = process.env.ANCHOR_HOME_DOMAIN || "testanchor.stellar.org";
-    const offramp = new AnchorOffRamp({
-      homeDomain,
-      sellerKeypair: Keypair.random(),
-    });
-
-    const quote = await offramp.quote({
-      sourceAsset: { code: "USDC", issuer: USDC_TESTNET_ISSUER },
-      sourceAmount: "10",
-      targetCurrency: "USD",
-    });
-
-    expect(Number(quote.rate)).toBeGreaterThan(0);
-    expect(quote.quoteId).toBeTruthy();
-
-    const initiation = await offramp.initiate({
-      linkId: "test-link-sep24",
-      quoteId: quote.quoteId,
-      payout: {
-        currency: "USD",
-        fields: { dest: "1234567890" },
-      },
-    });
-
-    expect(initiation.kind).toBe("interactive");
-    expect(initiation.jobId).toBeTruthy();
-    if (initiation.kind === "interactive") {
-      expect(initiation.url).toBeTruthy();
-    }
-
-    const jobStatus = await offramp.status(initiation.jobId);
-    expect(["pending", "settled", "failed"]).toContain(jobStatus.status);
-  });
-
 });

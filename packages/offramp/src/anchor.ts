@@ -1,6 +1,6 @@
-import type { Keypair } from "@stellar/stellar-sdk";
 import { OffRampJobNotFoundError, targetPerSourceRate } from "@checkout/core";
 import type {
+  AnchorCustomer,
   AssetRef,
   OffRampInitiation,
   OffRampJob,
@@ -15,12 +15,16 @@ import type {
   WithdrawTransfer,
 } from "@checkout/core";
 import { getSep38Quote } from "./sep38";
+import type { AnchorDiscovery, SellerAnchorAuth } from "./anchor-session";
 import { Sep24Client, type Sep24Transaction } from "./sep24";
 
 export interface AnchorOptions {
-  homeDomain: string;
-  /** Used only to authenticate to the anchor (SEP-10). It never signs a payment. */
-  sellerKeypair: Keypair;
+  discovery: AnchorDiscovery;
+  /**
+   * Per-seller anchor sessions. The seller's own wallet signs the SEP-10 challenge in the browser and
+   * only the resulting JWT is kept here; this adapter holds no key and signs nothing.
+   */
+  auth: SellerAnchorAuth;
   /**
    * Where quotes and jobs live. Required, with no in-memory default: a withdrawal's state has to
    * survive a restart (a mid-withdrawal restart must not lose the quote its transfer is checked against).
@@ -73,28 +77,28 @@ export function mapSep24Status(status: string): OffRampJobStatus {
  * Non-custodial: at `pending_user_transfer_start` it returns the anchor's transfer instructions and the
  * SELLER'S WALLET signs and sends them. Nothing in this adapter signs or submits a payment.
  *
+ * Authenticates per seller, exactly like `TestAnchorOffRamp`: every call runs with the JWT of the seller's own
+ * session (`SellerAnchorAuth`), never a server-held key (issue #207; `pnpm check:no-server-signing` enforces it).
+ *
  * Still NOT exported from `index.ts` and not selectable via `OFFRAMP`: `TestAnchorOffRamp` (SEP-6) is the
- * adapter wired into the container. Quotes and jobs now live in the injected `OffRampStateRepository`, which
- * is required, so the old blocker (in-process state lost on restart) is gone. What remains before it could be
- * exported is that it still authenticates to the anchor with one platform keypair instead of per-seller
- * SEP-10 sessions like `TestAnchorOffRamp`.
+ * adapter wired into the container. See docs/decisions/0001-sep6-vs-sep24.md for why SEP-24 stays unwired.
  */
 export class AnchorOffRamp implements OffRampPort {
   readonly mode: OffRampMode = "seller_initiated";
 
   private readonly homeDomain: string;
-  private readonly sellerKeypair: Keypair;
+  private readonly auth: SellerAnchorAuth;
   private readonly sep24: Sep24Client;
   private readonly state: OffRampStateRepository;
 
   constructor(opts: AnchorOptions) {
-    this.homeDomain = opts.homeDomain;
-    this.sellerKeypair = opts.sellerKeypair;
+    this.homeDomain = opts.discovery.homeDomain;
+    this.auth = opts.auth;
     if (!opts.state) {
       throw new Error("AnchorOffRamp needs an OffRampStateRepository: withdrawal state must survive a restart");
     }
     this.state = opts.state;
-    this.sep24 = new Sep24Client(opts.sellerKeypair, opts.homeDomain);
+    this.sep24 = new Sep24Client(opts.discovery);
   }
 
   /**
@@ -111,9 +115,10 @@ export class AnchorOffRamp implements OffRampPort {
     sourceAsset: AssetRef;
     sourceAmount: string;
     targetCurrency: string;
+    customer: AnchorCustomer;
   }): Promise<OffRampQuote> {
     const discovery = await this.sep24.getDiscoveryInfo();
-    const token = await this.sep24["getAuthToken"]();
+    const token = await this.auth.token(input.customer);
 
     const q = await getSep38Quote(discovery.anchorQuoteServer, token, {
       sellAsset: input.sourceAsset,
@@ -160,15 +165,16 @@ export class AnchorOffRamp implements OffRampPort {
     linkId: string;
     quoteId: string;
     payout: SellerPayoutRef;
+    customer: AnchorCustomer;
   }): Promise<OffRampInitiation> {
     const q = await this.state.getQuote(input.quoteId);
     if (!q) throw new Error("Unknown or expired quote");
 
-    const interactiveResult = await this.sep24.startInteractiveWithdraw({
+    const interactiveResult = await this.sep24.startInteractiveWithdraw(await this.auth.token(input.customer), {
       assetCode: q.sellAsset.code,
       assetIssuer: q.sellAsset.issuer || undefined,
       amount: q.sellAmount,
-      account: this.sellerKeypair.publicKey(),
+      account: input.customer.account,
       quoteId: input.quoteId,
       payoutFields: input.payout.fields,
     });
@@ -178,9 +184,8 @@ export class AnchorOffRamp implements OffRampPort {
       jobId: interactiveResult.id,
       linkId: input.linkId,
       anchor: this.homeDomain,
-      // Authenticated with the platform keypair, not a seller's own SEP-10 session.
-      sellerId: null,
-      account: null,
+      sellerId: input.customer.sellerId,
+      account: input.customer.account,
       targetCurrency: q.buyCurrency,
       targetAmount: "",
       rate: targetPerSourceRate(q.price),
@@ -212,7 +217,11 @@ export class AnchorOffRamp implements OffRampPort {
       throw new OffRampJobNotFoundError(jobId);
     }
 
-    const tx: Sep24Transaction = await this.sep24.getTransaction(jobId);
+    // A job with no seller ran under the old shared platform account; no seller's session can read it.
+    if (!stored.sellerId || !stored.account) throw new OffRampJobNotFoundError(jobId);
+
+    const token = await this.auth.token({ sellerId: stored.sellerId, account: stored.account });
+    const tx: Sep24Transaction = await this.sep24.getTransaction(token, jobId);
     const jobStatus = mapSep24Status(tx.status);
 
     if (tx.status === "pending_user_transfer_start" && tx.withdrawAnchorAccount) {

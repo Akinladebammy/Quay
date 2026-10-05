@@ -43,8 +43,11 @@ graph LR
   and `WatcherPort` (`HorizonWatcher`, polls Horizon for payments and normalizes them).
 - **`packages/offramp`** — implements `OffRampPort` twice: `MockAnchorOffRamp` (offline,
   fake FX rate, no money moves — the default) and `TestAnchorOffRamp` (real SEP-10 → SEP-38
-  → SEP-6 against `testanchor.stellar.org`). `sep10.ts` is the *client*-side reference this
-  doc's SEP-10 diagram mirrors on the server side, if/when 6.1 (wallet-native login) lands.
+  → SEP-6 against `testanchor.stellar.org`). Nothing under `src/` here holds a keypair any
+  more (#207): the old SEP-10 client moved to `test/sep10.ts` as a test-only reference, and the
+  unwired SEP-24 adapter (`anchor.ts`) no longer signs a payment or a challenge — it uses the
+  seller's session JWT from `anchor-session.ts` (`SellerAnchorAuth`), which verifies and
+  relays a challenge for the seller's own wallet to sign.
 - **`apps/api`** — the composition root. `services/container.ts` wires one `RailPort` +
   one `WatcherPort` + one `OffRampPort` + the Drizzle repositories into `LinkService` and
   `WatcherLoop`, then Hono routes call `LinkService`. This is the *only* place all three
@@ -66,6 +69,15 @@ shapes (`PaymentRequest`, `NormalizedPayment`, `OffRampQuote`, `OffRampJob`).
 `packages/core/src` and fails if any file imports `@stellar/*`, any `node:*` module, or
 either adapter package. It runs in CI (`pnpm docs:check-domain-boundary`, see `ci.yml`), so
 a PR that violates the boundary fails the build, not just code review.
+
+The non-custodial rule — the server never signs for a seller — has its own guard.
+`scripts/check-no-server-signing.mjs` walks `apps/api/src` and `packages/offramp/src` and
+fails if any file calls `.sign(`, turns a seed into a signer with `Keypair.fromSecret(`, or
+builds a server-signed SEP-10 challenge with `WebAuth.buildChallengeTx(`. The files allowed
+to do the last two are named, with a reason each, in the script's `ALLOWLIST`:
+`services/challenge.ts` (Quay's own login challenge, signed by a key that holds no funds)
+and `services/seller-wallet.ts` (config validation). It runs in CI
+(`pnpm check:no-server-signing`) next to the boundary check.
 
 ---
 
@@ -364,6 +376,9 @@ a real compliance story — see the README's boundary note.
 popup handling all exist — and the protocol is chosen per anchor from its SEP-1
 capabilities, preferring SEP-6 when both are declared. The full trade-offs and the
 decision live in [`docs/decisions/0001-sep6-vs-sep24.md`](decisions/0001-sep6-vs-sep24.md).
+The SEP-24 adapter (`AnchorOffRamp`) stays unwired, and since #207 it holds no key: it runs
+every anchor call with the seller's own session JWT and returns the send leg as transfer
+instructions for the seller's wallet to sign.
 
 **Why path-payment settlement is parked** (decided 2026-07-18, see `MAINTAINER.md`).
 Evaluated settling sellers in NGNC on-chain via Stellar path payments (buyer pays USDC,
