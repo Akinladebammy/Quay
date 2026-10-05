@@ -20,6 +20,7 @@ import {
 } from "../../lib/anchor-session";
 import ApiKeys from "./ApiKeys";
 import KycPanel from "./KycPanel";
+import RegistrationForm from "./RegistrationForm";
 import ErasePanel from "./ErasePanel";
 import type { KycLoadState } from "../../lib/kyc-load";
 import DisclosuresPanel from "./DisclosuresPanel";
@@ -649,6 +650,7 @@ export default function Dashboard() {
 
       {OFFRAMP_ENABLED && !OFFRAMP_IS_MOCK && (
         <>
+          <RegistrationForm />
           <KycPanel
             kyc={kyc}
             anchor={anchorAuth}

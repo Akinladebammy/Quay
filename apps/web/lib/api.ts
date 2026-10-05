@@ -96,6 +96,26 @@ export interface KycView {
   lastSyncedAt: number | null;
 }
 
+/** The seller's stored identity profile, keyed by SEP-9 field name. PII: never log or persist it. */
+export interface ProfileView {
+  fields: Record<string, string>;
+  updatedAt: Record<string, number>;
+}
+
+/** Wire shape of GET/PUT /seller/profile (issue 4.23). */
+interface ProfileResponse {
+  fields: Array<{ field: string; value: string; source: string; updatedAt: number }>;
+}
+
+export function toProfileView(res: ProfileResponse): ProfileView {
+  const view: ProfileView = { fields: {}, updatedAt: {} };
+  for (const f of res.fields ?? []) {
+    view.fields[f.field] = f.value;
+    view.updatedAt[f.field] = f.updatedAt;
+  }
+  return view;
+}
+
 /** Disclosure metadata only. Field values must never appear in this response. */
 export interface KycDisclosure {
   anchorDomain: string;
@@ -593,6 +613,10 @@ export const api = {
   logout: () => http<{ ok: true }>("/auth/logout", { method: "POST" }).finally(() => setSessionToken(null)),
   getKyc: (opts?: { refresh?: boolean }) =>
     http<KycView>(`/seller/kyc${opts?.refresh ? "?refresh=1" : ""}`),
+  getProfile: () => http<ProfileResponse>("/seller/profile").then(toProfileView),
+  /** Sends only the given fields; the API rejects empty values with 422 `invalid_fields`. */
+  saveProfile: (fields: Record<string, string>) =>
+    http<ProfileResponse>("/seller/profile", { method: "PUT", body: JSON.stringify(fields) }).then(toProfileView),
   /** Right to erasure (NDPA). Session auth only; `confirm` must be the seller's wallet address. */
   eraseProfile: (confirm: string) =>
     http<ErasureResult>("/seller/profile", { method: "DELETE", body: JSON.stringify({ confirm }) }),
