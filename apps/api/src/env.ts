@@ -265,6 +265,11 @@ export const env = {
   // refuses a mismatch rather than quoting it anyway.
   offrampRateCurrency: process.env.OFFRAMP_RATE_CURRENCY || undefined,
   offrampRateSourceAsset: process.env.OFFRAMP_RATE_SOURCE_ASSET || undefined,
+  // How long an anchor-interactive job may sit at the upstream `incomplete`
+  // status before pollCashOuts fails it as abandoned (issue 5.20). The seller
+  // closed the anchor's window without finishing; without this the link would
+  // stay `offramp_pending` indefinitely.
+  offrampInteractiveTimeoutMs: num("OFFRAMP_INTERACTIVE_TIMEOUT_MS", 3_600_000),
   // Testnet-only convenience secret for demo scripts (pnpm demo:seed / pnpm demo:reset).
   // Never set on public network.
   defaultSellerSecret: process.env.DEFAULT_SELLER_SECRET || undefined,
@@ -301,6 +306,8 @@ export const env = {
   // and "none" has no KYC lifecycle to store PII for.
   kycEncryptionKey:
     offramp === "testanchor" || offramp === "anchor" ? req("KYC_ENCRYPTION_KEY") : undefined,
+  // TTL (ms) for caching SEP-12 KYC status lookups per seller before re-querying the anchor.
+  kycStatusCacheMs: num("KYC_STATUS_CACHE_MS", 60000),
   // Retention window (days) for inactive seller KYC & identity data (NDPA compliance).
   // Purges seller KYC and payout fields after N days without activity. Default 730 (2 years).
   // Set to 0 to disable the retention purge.
@@ -316,6 +323,8 @@ export const env = {
   // Optional comma-separated list of previous 32-byte hex keys used for decrypting
   // older KYC records during key rotation.
   kycEncryptionKeyPrevious: process.env.KYC_ENCRYPTION_KEY_PREVIOUS || undefined,
+  // Maximum allowed size (bytes) for multipart KYC file uploads (default 10 MiB).
+  kycMaxUploadBytes: num("KYC_MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
 } as const;
 
 // A production process with the e2e backdoors mounted would accept

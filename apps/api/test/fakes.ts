@@ -4,6 +4,7 @@ import {
   type AssetRef,
   type CreateLinkInput,
   type KycPort,
+  type KycStatusOptions,
   type AnchorCustomer,
   type KycRecord,
   type LinkPaymentRecord,
@@ -316,7 +317,7 @@ export class FakeOffRampStateRepository implements OffRampStateRepository {
 
   async updateJob(
     jobId: string,
-    patch: Partial<Pick<StoredOffRampJob, "targetAmount" | "status" | "externalStatus" | "lastError" | "transferNotifiedAt">>,
+    patch: Partial<Pick<StoredOffRampJob, "targetAmount" | "status" | "externalStatus" | "lastError" | "transfer" | "transferNotifiedAt" | "lastPollError" | "lastPollErrorAt" | "lastPollReason">>,
   ): Promise<void> {
     const job = this.jobs.get(jobId);
     if (!job) return;
@@ -358,6 +359,9 @@ export class AlwaysAcceptedKyc implements KycPort {
   async submit(customer: AnchorCustomer): Promise<KycRecord> {
     return this.accepted(customer);
   }
+  async submitFiles(customer: AnchorCustomer): Promise<KycRecord> {
+    return this.accepted(customer);
+  }
   private accepted({ sellerId, account }: AnchorCustomer): KycRecord {
     return {
       sellerId,
@@ -378,13 +382,16 @@ export class AlwaysAcceptedKyc implements KycPort {
 
 /** Fully scripted KycPort for testing the cash-out gate itself. */
 export class ScriptedKyc implements KycPort {
-  statusImpl: (customer: AnchorCustomer) => Promise<KycRecord> = () => {
+  statusImpl: (customer: AnchorCustomer, opts?: KycStatusOptions) => Promise<KycRecord> = () => {
     throw new Error("statusImpl not configured");
   };
-  async status(customer: AnchorCustomer): Promise<KycRecord> {
-    return this.statusImpl(customer);
+  async status(customer: AnchorCustomer, opts?: KycStatusOptions): Promise<KycRecord> {
+    return this.statusImpl(customer, opts);
   }
   async submit(customer: AnchorCustomer): Promise<KycRecord> {
+    return this.statusImpl(customer);
+  }
+  async submitFiles(customer: AnchorCustomer): Promise<KycRecord> {
     return this.statusImpl(customer);
   }
 }

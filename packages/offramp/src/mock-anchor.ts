@@ -165,6 +165,14 @@ export class MockAnchorOffRamp implements OffRampPort {
       sellAmount: input.sourceAmount,
       buyCurrency: input.targetCurrency,
       price: String(rate),
+      quotedAmounts: {
+        rate: String(rate),
+        targetAmount,
+        feeAmount,
+        feeSource: "estimated",
+        netTargetAmount,
+        quoteKind: "firm",
+      },
       expiresAt,
       createdAt: now,
     });
@@ -213,9 +221,12 @@ export class MockAnchorOffRamp implements OffRampPort {
       targetCurrency: q.buyCurrency,
       targetAmount,
       rate: q.price,
-      status: "pending",
+      status: "awaiting_transfer",
       externalStatus: null,
       lastError: null,
+      lastPollError: null,
+      lastPollErrorAt: null,
+      lastPollReason: null,
       transferNotifiedAt: null,
       createdAt: now,
       updatedAt: now,
@@ -230,11 +241,22 @@ export class MockAnchorOffRamp implements OffRampPort {
     const job = await this.state.getJob(jobId);
     if (!job) throw new OffRampJobNotFoundError(jobId);
 
+    const elapsed = Date.now() - job.createdAt;
     let status = job.status;
     let lastError = job.lastError;
-    if (status === "pending" && Date.now() - job.createdAt >= this.settleAfterMs) {
-      status = this.alwaysFail ? "failed" : "settled";
-      lastError = status === "failed" ? "mock anchor: simulated payout failure" : null;
+    // A terminal job never moves again: the anchor does not un-settle a payout.
+    if (status !== "settled" && status !== "failed") {
+      if (elapsed >= this.settleAfterMs) {
+        status = this.alwaysFail ? "failed" : "settled";
+        lastError = status === "failed" ? "mock anchor: simulated payout failure" : null;
+      } else if (elapsed >= this.settleAfterMs / 2) {
+        status = "pending";
+      } else {
+        status = "awaiting_transfer";
+      }
+    }
+
+    if (status !== job.status) {
       await this.state.updateJob(jobId, { status, lastError });
       log.info({ event: "anchor.mock.status.transition", jobId, status }, "mock status transition");
     }

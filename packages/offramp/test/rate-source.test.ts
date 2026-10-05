@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Keypair, Networks } from "@stellar/stellar-sdk";
-import type { AnchorCustomer, FxRate, RateSourcePort } from "@checkout/core";
+import { OffRampRejectedError, type AnchorCustomer, type FxRate, type RateSourcePort } from "@checkout/core";
 import { AnchorDiscovery, SellerAnchorAuth } from "../src/anchor-session";
 import { TestAnchorOffRamp } from "../src/testanchor";
 import { RateUnavailableError, StaticRateSource } from "../src/rates";
@@ -402,5 +402,78 @@ describe("RateUnavailableError", () => {
     expect(err).toBeInstanceOf(Error);
     expect(err.source).toBe("static");
     expect(err.name).toBe("RateUnavailableError");
+  });
+});
+
+describe("no-SEP-38 quote money handling (review fixes for 3.22)", () => {
+  const SELL = { code: "USDC", issuer: USDC_TESTNET_ISSUER };
+
+  function stubInfo(extra: { fee_fixed?: number; fee_percent?: number }) {
+    const info = {
+      withdraw: {
+        USDC: {
+          enabled: true,
+          min_amount: 0.0001,
+          max_amount: 10000,
+          ...extra,
+          types: { bank_account: { name: "bank_account", fields: { dest: { description: "Account" } } } },
+        },
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) =>
+        String(input).includes("/sep6/info")
+          ? new Response(JSON.stringify(info), { status: 200, headers: { "content-type": "application/json" } })
+          : new Response("", { status: 404 }),
+      ),
+    );
+  }
+
+  const quoteOf = (offramp: TestAnchorOffRamp, sourceAmount: string) =>
+    offramp.quote({ linkId: "lnk_1", sourceAsset: SELL, sourceAmount, targetCurrency: "NGN", customer: CUSTOMER });
+
+  it("rejects a quote whose fees swallow the amount, as a 422-class refusal", async () => {
+    const { offramp } = makeWiring({ rateSource: staticRate() });
+    stubInfo({ fee_fixed: 20 });
+    const err = await quoteOf(offramp, "10").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(OffRampRejectedError);
+    expect((err as Error).message).not.toMatch(/1600/);
+  });
+
+  it("rejects a zero net exactly at the boundary", async () => {
+    const { offramp } = makeWiring({ rateSource: staticRate() });
+    stubInfo({ fee_fixed: 10 });
+    await expect(quoteOf(offramp, "10")).rejects.toBeInstanceOf(OffRampRejectedError);
+  });
+
+  it("rejects a tiny rate that rounds the payout to zero", async () => {
+    const { offramp } = makeWiring({ rateSource: staticRate({ rate: "0.00001" }) });
+    stubInfo({});
+    await expect(quoteOf(offramp, "1")).rejects.toBeInstanceOf(OffRampRejectedError);
+  });
+
+  it("rounds net down and fee up, and net equals gross minus fee exactly", async () => {
+    const { offramp } = makeWiring({ rateSource: staticRate({ rate: "1.00005" }) });
+    stubInfo({ fee_fixed: 0.00003 });
+    const q = await quoteOf(offramp, "1");
+    expect(q.netTargetAmount).toBe("1.0000");
+    expect(q.fee.amount).toBe("0.0001");
+    expect((Number(q.targetAmount) - Number(q.fee.amount)).toFixed(4)).toBe(q.netTargetAmount);
+  });
+
+  it("persists quotedAmounts (with quoteKind) so a by-id confirm can replay the quote", async () => {
+    const { offramp, state } = makeWiring({ rateSource: staticRate() });
+    stubInfo({ fee_fixed: 5, fee_percent: 1 });
+    const q = await quoteOf(offramp, "10");
+    const stored = await state.getQuote(q.quoteId);
+    expect(stored?.quotedAmounts).toEqual({
+      rate: "1600",
+      targetAmount: q.targetAmount,
+      feeAmount: q.fee.amount,
+      feeSource: "estimated",
+      netTargetAmount: q.netTargetAmount,
+      quoteKind: "indicative",
+    });
   });
 });

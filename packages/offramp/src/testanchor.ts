@@ -8,12 +8,14 @@ import {
   type OffRampJobStatus,
   type OffRampMode,
   type OffRampPort,
+  OffRampRejectedError,
   type OffRampQuote,
   type IndicativePrice,
   type OffRampStateRepository,
   type OfframpRequirementTypes,
   type RateSourcePort,
   type SellerPayoutRef,
+  type WithdrawTransfer,
   type WithdrawTypeRequirements,
 } from "@checkout/core";
 import { NOOP_LOGGER, targetPerSourceRate } from "@checkout/core";
@@ -22,6 +24,7 @@ import { listsCurrency, type Sep1DiscoveryInfo } from "./sep1";
 import { getSep38Prices, getSep38Quote } from "./sep38";
 import { getSep6Info, getSep6Transaction, resolveWithdrawType, startSep6Withdraw } from "./sep6";
 import { randomBytes } from "node:crypto";
+import { computeIndicativeAmounts } from "./quote-math";
 
 /**
  * A local quote id for the no-SEP-38 path (issue 3.22). `apps/api` owns the
@@ -89,10 +92,61 @@ export interface TestAnchorOptions {
   logger?: Logger;
 }
 
-function mapSep6Status(status: string): OffRampJobStatus {
-  if (status === "completed") return "settled";
-  if (status === "error" || status === "refunded" || status === "expired") return "failed";
-  return "pending"; // pending_anchor, pending_user_transfer_start, pending_external, ...
+type Sep6TransactionStatus =
+  | "pending_anchor"
+  | "pending_user_transfer_start"
+  | "pending_user_transfer_complete"
+  | "pending_external"
+  | "on_hold"
+  | "pending_stellar"
+  | "pending_trust"
+  | "pending_user"
+  | "pending_customer_info_update"
+  | "pending_transaction_info_update"
+  | "incomplete"
+  | "completed"
+  | "refunded"
+  | "expired"
+  | "error"
+  | "no_market"
+  | "too_small"
+  | "too_large";
+
+interface Sep6StatusMapping {
+  status: OffRampJobStatus;
+  /** Fallback failure reason when the anchor sends no `message`. */
+  reason?: string;
+  /** The anchor is waiting on the seller (not terminal; link state is unchanged). */
+  needsSellerAction?: boolean;
+}
+
+/** Explicit SEP-6 transaction-history status mapping. */
+export const SEP6_STATUS_MAP: Record<Sep6TransactionStatus, Sep6StatusMapping> = {
+  pending_anchor: { status: "pending" },
+  pending_user_transfer_start: { status: "awaiting_transfer" },
+  pending_user_transfer_complete: { status: "pending" },
+  pending_external: { status: "pending" },
+  on_hold: { status: "pending" },
+  pending_stellar: { status: "pending" },
+  pending_trust: { status: "pending" },
+  pending_user: { status: "pending" },
+  pending_customer_info_update: { status: "pending", needsSellerAction: true },
+  pending_transaction_info_update: { status: "pending", needsSellerAction: true },
+  incomplete: { status: "awaiting_transfer" },
+  completed: { status: "settled" },
+  refunded: { status: "failed", reason: "withdrawal was refunded (refunded)" },
+  expired: { status: "failed", reason: "withdrawal expired (expired)" },
+  error: { status: "failed", reason: "anchor reported an error (error)" },
+  no_market: { status: "failed", reason: "no market for the asset pair (no_market)" },
+  too_small: { status: "failed", reason: "amount below the anchor's limit (too_small)" },
+  too_large: { status: "failed", reason: "amount above the anchor's limit (too_large)" },
+};
+
+export function mapSep6Status(status: string): Sep6StatusMapping {
+  if (Object.hasOwn(SEP6_STATUS_MAP, status)) {
+    return SEP6_STATUS_MAP[status as Sep6TransactionStatus];
+  }
+  return { status: "pending" };
 }
 
 export class TestAnchorOffRamp implements OffRampPort {
@@ -104,6 +158,7 @@ export class TestAnchorOffRamp implements OffRampPort {
   private readonly state: OffRampStateRepository;
   private readonly logger: Logger;
   private readonly rateSource: RateSourcePort | undefined;
+  private readonly unknownStatusesLogged = new Set<string>();
   /** Operator's chosen SEP-6 withdraw type; undefined means "infer, and refuse
    *  if the anchor offers more than one". See resolveWithdrawType. */
   private readonly preferredWithdrawType: string | undefined;
@@ -259,6 +314,11 @@ export class TestAnchorOffRamp implements OffRampPort {
       }, log);
 
       const expiresAt = Date.parse(q.expiresAt);
+      const grossTargetAmount = (Number(input.sourceAmount) / Number(q.price)).toFixed(4);
+      const netTargetAmount = q.buyAmount;
+      const feeAmount = (Number(grossTargetAmount) - Number(netTargetAmount)).toFixed(4);
+      const rate = targetPerSourceRate(q.price);
+
       await this.state.saveQuote({
         quoteId: q.id,
         linkId: input.linkId,
@@ -269,13 +329,19 @@ export class TestAnchorOffRamp implements OffRampPort {
         // Persisted so initiate() withdraws on the rail this price was quoted
         // for, rather than re-deriving it and possibly landing on another.
         withdrawType,
+        // What the seller is about to be shown, so a confirm-by-quoteId replays it.
+        quotedAmounts: {
+          rate,
+          targetAmount: grossTargetAmount,
+          feeAmount,
+          feeSource: "anchor",
+          netTargetAmount,
+          // The anchor quoted this number, so it is a promise rather than a guess.
+          quoteKind: "firm",
+        },
         expiresAt,
         createdAt: Date.now(),
       });
-
-      const grossTargetAmount = (Number(input.sourceAmount) / Number(q.price)).toFixed(4);
-      const netTargetAmount = q.buyAmount;
-      const feeAmount = (Number(grossTargetAmount) - Number(netTargetAmount)).toFixed(4);
 
       return {
         quoteId: q.id,
@@ -286,11 +352,10 @@ export class TestAnchorOffRamp implements OffRampPort {
         // OffRampQuote.rate is TARGET per source (issue 5.21); SEP-38's price
         // is the inverse. The raw price stays on the stored quote above —
         // this is a unit conversion at the boundary, not a loss of data.
-        rate: targetPerSourceRate(q.price),
+        rate,
         expiresAt,
         fee: { amount: feeAmount, currency: input.targetCurrency, source: "anchor" },
         netTargetAmount,
-        // The anchor quoted this number, so it is a promise rather than a guess.
         quoteKind: "firm",
       };
     }
@@ -303,7 +368,8 @@ export class TestAnchorOffRamp implements OffRampPort {
    *
    * The FX rate comes from a configured {@link RateSourcePort}; the fees come
    * from the anchor's own published /sep6/info, which `resolveWithdrawType`
-   * already returned and this adapter previously discarded. The arithmetic:
+   * already returned and this adapter previously discarded. The arithmetic
+   * (exact, see quote-math.ts):
    *
    *   gross = amount × rate
    *   fee   = (feeFixed + amount × feePercent/100) × rate
@@ -311,8 +377,11 @@ export class TestAnchorOffRamp implements OffRampPort {
    *
    * The fee is published in the SELL asset — that is what /sep6/info's
    * feeFixed/feePercent mean — so it is converted at the same rate rather than
-   * added in the target currency. Both the quote and its fee are marked
-   * indicative/estimated, because the anchor, not us, decides the final amount.
+   * added in the target currency. Net rounds down and fee rounds up, so the
+   * seller is never shown more than they get; a quote whose net is zero or
+   * negative is refused (422, not a circuit-breaker failure). Both the quote
+   * and its fee are marked indicative/estimated, because the anchor, not us,
+   * decides the final amount.
    */
   private async quoteWithoutSep38(args: {
     input: {
@@ -340,14 +409,23 @@ export class TestAnchorOffRamp implements OffRampPort {
       sourceAsset: input.sourceAsset,
       targetCurrency: input.targetCurrency,
     });
-    const rate = Number(fx.rate);
-    const amount = Number(input.sourceAmount);
 
-    const gross = amount * rate;
-    // Absent fee fields mean no fee, not NaN.
-    const feeInSellAsset = (feeFixed ?? 0) + amount * ((feePercent ?? 0) / 100);
-    const fee = feeInSellAsset * rate;
-    const net = gross - fee;
+    const amounts = computeIndicativeAmounts({
+      amount: input.sourceAmount,
+      rate: fx.rate,
+      feeFixed,
+      feePercent,
+    });
+    if (!amounts.ok) {
+      // Never the rate or the fee schedule in the message: it reaches the client.
+      throw new OffRampRejectedError(
+        amounts.reason === "non_positive_net"
+          ? "The anchor's fees are at least as large as this amount, so nothing would be paid out. Try a larger amount."
+          : "This amount is too small to produce a payout at the current rate. Try a larger amount.",
+      );
+    }
+    const { targetAmount, feeAmount, netTargetAmount } = amounts;
+    const rate = fx.rate;
 
     // Locally generated: there is no anchor quote id to persist, and initiate()
     // never sends this to the anchor, where it would mean nothing.
@@ -360,8 +438,18 @@ export class TestAnchorOffRamp implements OffRampPort {
       buyCurrency: input.targetCurrency,
       // Persisted in the same units the SEP-38 path uses (source per target) so
       // every existing reader — telemetry, the job row — stays consistent.
-      price: String(1 / rate),
+      price: String(1 / Number(rate)),
       withdrawType,
+      // What the seller is about to be shown, so a confirm-by-quoteId replays it
+      // (without this every indicative quote 409s as quote_mismatch).
+      quotedAmounts: {
+        rate,
+        targetAmount,
+        feeAmount,
+        feeSource: "estimated",
+        netTargetAmount,
+        quoteKind: "indicative",
+      },
       expiresAt: fx.expiresAt,
       createdAt: Date.now(),
     });
@@ -384,11 +472,11 @@ export class TestAnchorOffRamp implements OffRampPort {
       sourceAsset: input.sourceAsset,
       sourceAmount: input.sourceAmount,
       targetCurrency: input.targetCurrency,
-      targetAmount: gross.toFixed(4),
-      rate: String(fx.rate),
+      targetAmount,
+      rate,
       expiresAt: fx.expiresAt,
-      fee: { amount: fee.toFixed(4), currency: input.targetCurrency, source: "estimated" },
-      netTargetAmount: net.toFixed(4),
+      fee: { amount: feeAmount, currency: input.targetCurrency, source: "estimated" },
+      netTargetAmount,
       quoteKind: "indicative",
     };
   }
@@ -429,6 +517,7 @@ export class TestAnchorOffRamp implements OffRampPort {
     }, baseLog);
 
     const now = Date.now();
+    const initialStatus: OffRampJobStatus = withdraw.accountId ? "awaiting_transfer" : "pending";
     await this.state.saveJob({
       jobId: withdraw.id,
       linkId: input.linkId,
@@ -441,9 +530,14 @@ export class TestAnchorOffRamp implements OffRampPort {
       // job.rate at settlement, so a sell-per-buy value here would poison
       // the spread exactly the way issue 5.21 describes.
       rate: targetPerSourceRate(q.price),
-      status: "pending",
+      status: initialStatus,
       externalStatus: null,
       lastError: null,
+      sellAsset: q.sellAsset,
+      sellAmount: q.sellAmount,
+      lastPollError: null,
+      lastPollErrorAt: null,
+      lastPollReason: null,
       transferNotifiedAt: null,
       createdAt: now,
       updatedAt: now,
@@ -452,7 +546,8 @@ export class TestAnchorOffRamp implements OffRampPort {
 
     // The anchor pays out only after it receives the asset, and only the
     // seller can send it. Hand back exactly what the anchor asked for; when it
-    // has not said yet (e.g. review pending) the job simply stays pending.
+    // has not said yet (e.g. review pending) the job stays pending and
+    // `status()` relays the instructions once the anchor publishes them.
     if (!withdraw.accountId) return { kind: "fields", jobId: withdraw.id };
     return {
       kind: "transfer",
@@ -480,15 +575,45 @@ export class TestAnchorOffRamp implements OffRampPort {
     const child = baseLog.child({ jobId, linkId: job.linkId });
     const jwt = await this.auth.token({ sellerId: job.sellerId, account: job.account });
     const tx = await getSep6Transaction((await this.discover()).transferServer, jwt, jobId, baseLog);
-    const status = mapSep6Status(tx.status);
+    const mappedStatus = mapSep6Status(tx.status);
+    if (!Object.hasOwn(SEP6_STATUS_MAP, tx.status) && !this.unknownStatusesLogged.has(jobId)) {
+      this.unknownStatusesLogged.add(jobId);
+      child.warn({ event: "anchor.sep6.status.unknown", status: tx.status }, "unknown SEP-6 transaction status");
+    }
+    const status = mappedStatus.status;
     const targetAmount = tx.amountOut ?? job.targetAmount;
-    const reason = status === "failed" ? (tx.message ?? `${this.anchorName}: withdrawal failed`) : null;
+    const reason =
+      status === "failed" ? tx.message || mappedStatus.reason || `${this.anchorName}: withdrawal failed` : null;
+
+    // SEP-6 lets the anchor leave the deposit instructions out of /withdraw and
+    // publish them here, at pending_user_transfer_start. Without relaying them
+    // nothing would ever ask the seller to send the asset.
+    let transfer: WithdrawTransfer | undefined;
+    if (tx.status === "pending_user_transfer_start" && tx.withdrawAnchorAccount) {
+      if (!job.sellAsset) {
+        // Row from before the asset was stored; we cannot name what to send.
+        child.warn(
+          { event: "anchor.sep6.transfer.unresolvable", jobId },
+          "anchor published deposit instructions but the job has no sell asset",
+        );
+      } else {
+        transfer = {
+          destination: tx.withdrawAnchorAccount,
+          amount: tx.amountIn ?? job.sellAmount ?? "",
+          asset: job.sellAsset,
+          memo: tx.withdrawMemo ?? null,
+          memoType: tx.withdrawMemoType ?? null,
+        };
+        if (!transfer.amount) transfer = undefined;
+      }
+    }
 
     await this.state.updateJob(jobId, {
       targetAmount,
       status,
       externalStatus: tx.status,
       lastError: reason,
+      ...(transfer ? { transfer } : {}),
     });
 
     return {
@@ -499,6 +624,8 @@ export class TestAnchorOffRamp implements OffRampPort {
       targetAmount,
       rate: job.rate,
       reason: reason ?? undefined,
+      ...(transfer ? { transfer } : {}),
+      ...(mappedStatus.needsSellerAction ? { needsSellerAction: true } : {}),
     };
   }
 }

@@ -22,7 +22,8 @@
 //      committing to a stale figure is the failure mode this whole issue exists
 //      to prevent.
 
-import { targetPerSourceRate, type FxRate, type RateSourcePort } from "@checkout/core";
+import { NOOP_LOGGER, targetPerSourceRate, type FxRate, type Logger, type RateSourcePort } from "@checkout/core";
+import { truncateAnchorBody } from "../anchor-error";
 import { getSep38Prices } from "../sep38";
 
 /** Thrown when a rate source cannot produce a usable, unexpired rate. */
@@ -227,8 +228,41 @@ export interface HttpJsonRateSourceOptions {
    * cannot run in the constructor.
    */
   guard?: (url: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  /** Per-request timeout in ms. Default 5000. */
+  timeoutMs?: number;
+  /** Largest response body accepted, in bytes. Default 64 KiB. */
+  maxBodyBytes?: number;
+  /** Server-side diagnostics only; nothing logged here reaches a client. */
+  logger?: Logger;
   source?: string;
   now?: () => number;
+}
+
+const DEFAULT_HTTP_TIMEOUT_MS = 5_000;
+const DEFAULT_HTTP_MAX_BODY_BYTES = 64 * 1024;
+
+/** Reads a response body, refusing to buffer more than `maxBytes`. */
+async function readBoundedText(res: Response, maxBytes: number): Promise<string | null> {
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    return null;
+  }
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
 }
 
 /**
@@ -249,7 +283,8 @@ export class HttpJsonRateSource implements RateSourcePort {
     try {
       parsed = new URL(opts.url);
     } catch {
-      throw new RateUnavailableError(opts.source ?? "http", `OFFRAMP_RATE_URL "${opts.url}" is not a valid URL`);
+      // Not echoed: a configured URL can carry query-string credentials.
+      throw new RateUnavailableError(opts.source ?? "http", "OFFRAMP_RATE_URL is not a valid URL");
     }
     // https only, unconditionally: this is a rate we quote to a seller, and a
     // plaintext hop is a MITM on the seller's payout amount.
@@ -272,7 +307,7 @@ export class HttpJsonRateSource implements RateSourcePort {
     if (!result.ok) {
       throw new RateUnavailableError(
         this.opts.source ?? "http",
-        `rate URL ${this.opts.url} rejected by the SSRF guard: ${result.reason}`,
+        `rate URL host ${new URL(this.opts.url).host} rejected by the SSRF guard: ${result.reason}`,
       );
     }
   }
@@ -297,35 +332,71 @@ export class HttpJsonRateSource implements RateSourcePort {
       );
     }
 
-    const res = await fetch(this.opts.url, { headers: { accept: "application/json" } });
-    if (!res.ok) {
-      throw new RateUnavailableError(
-        this.opts.source ?? "http",
-        `rate endpoint ${this.opts.url} returned ${res.status} ${await res.text()}`,
-      );
+    const source = this.opts.source ?? "http";
+    const log = (this.opts.logger ?? NOOP_LOGGER).child({ component: "rate-source", source });
+    const maxBytes = this.opts.maxBodyBytes ?? DEFAULT_HTTP_MAX_BODY_BYTES;
+
+    // The SSRF guard validated the configured URL once, at boot. `redirect:
+    // "error"` keeps a 30x from walking the request to a host it never
+    // checked, and the timeout keeps a slow endpoint from holding the quote.
+    // Errors from here are generic: neither the URL (it may carry a secret in
+    // its query string) nor the remote body ever reaches a message.
+    let res: Response;
+    try {
+      res = await fetch(this.opts.url, {
+        headers: { accept: "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(this.opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS),
+      });
+    } catch (err) {
+      log.warn({ event: "rate.http.fetch_failed", error: err instanceof Error ? err.name : "unknown" }, "rate fetch failed");
+      throw new RateUnavailableError(source, "rate endpoint could not be reached (timeout, redirect, or network error)");
     }
-    const body = (await res.json()) as unknown;
+    if (!res.ok) {
+      const detail = await readBoundedText(res, 2048).catch(() => null);
+      log.warn(
+        { event: "rate.http.bad_status", statusCode: res.status, body: truncateAnchorBody(detail ?? "") },
+        "rate endpoint returned a non-2xx status",
+      );
+      throw new RateUnavailableError(source, `rate endpoint returned HTTP ${res.status}`);
+    }
+    let text: string | null;
+    try {
+      text = await readBoundedText(res, maxBytes);
+    } catch {
+      throw new RateUnavailableError(source, "rate endpoint response could not be read");
+    }
+    if (text === null) {
+      throw new RateUnavailableError(source, `rate endpoint response exceeds ${maxBytes} bytes`);
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw new RateUnavailableError(source, "rate endpoint did not return valid JSON");
+    }
     const found = readPath(body, this.opts.jsonPath);
     if (typeof found !== "string" && typeof found !== "number") {
-      throw new RateUnavailableError(
-        this.opts.source ?? "http",
-        `rate endpoint ${this.opts.url}: no value at JSON path "${this.opts.jsonPath}"`,
-      );
+      throw new RateUnavailableError(source, `rate endpoint: no value at JSON path "${this.opts.jsonPath}"`);
     }
 
-    // An endpoint that publishes its own expiry is trusted over our default —
-    // the operator who publishes one is telling us when it goes stale.
+    // The endpoint may shorten the rate's life but never extend it: a remote
+    // that says "valid until 2099" would otherwise turn a stale number into
+    // one we quote to sellers indefinitely. Capped at now + our own TTL.
+    const now = this.now();
+    const ceiling = now + (this.opts.defaultTtlMs ?? 60_000);
     const expires = readPath(body, "expiresAt") ?? readPath(body, "expires_at");
-    const expiresAt =
+    const remoteExpiry =
       typeof expires === "number"
         ? expires
         : typeof expires === "string" && Number.isFinite(Date.parse(expires))
           ? Date.parse(expires)
-          : this.now() + (this.opts.defaultTtlMs ?? 60_000);
+          : undefined;
+    const expiresAt = remoteExpiry === undefined ? ceiling : Math.min(remoteExpiry, ceiling);
 
     return assertFresh({
       rate: assertUsableRate(String(found), this.opts.source ?? "http"),
-      source: this.opts.source ?? this.opts.url,
+      source: source,
       asOf: this.now(),
       expiresAt,
     });

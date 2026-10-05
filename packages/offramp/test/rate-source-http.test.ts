@@ -54,6 +54,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+const ARGS = { anchorDomain: "anchor.example", sourceAsset: { code: "USDC" }, targetCurrency: "NGN" };
+
 describe("HttpJsonRateSource", () => {
   const base = {
     url: "https://anchor.example/api/rates.json",
@@ -83,12 +85,20 @@ describe("HttpJsonRateSource", () => {
       "fetch",
       vi.fn(async () => new Response(JSON.stringify({ data: { rate: "1610" }, expiresAt: expires }), { status: 200 })),
     );
-    const fx = await new HttpJsonRateSource(base).rate({
-      anchorDomain: "anchor.example",
-      sourceAsset: { code: "USDC" },
-      targetCurrency: "NGN",
-    });
+    const fx = await new HttpJsonRateSource({ ...base, defaultTtlMs: 300_000 }).rate(ARGS);
     expect(fx.expiresAt).toBe(expires);
+  });
+
+  it("caps a far-future payload expiry at now + the source's default TTL", async () => {
+    const tenYears = Date.now() + 10 * 365 * 24 * 3600_000;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ data: { rate: "1610" }, expiresAt: tenYears }), { status: 200 })),
+    );
+    const before = Date.now();
+    const fx = await new HttpJsonRateSource({ ...base, defaultTtlMs: 60_000 }).rate(ARGS);
+    expect(fx.expiresAt).toBeLessThanOrEqual(Date.now() + 60_000);
+    expect(fx.expiresAt).toBeGreaterThanOrEqual(before + 60_000);
   });
 
   it("refuses a payload whose published expiry has passed", async () => {
@@ -157,6 +167,102 @@ describe("HttpJsonRateSource", () => {
         targetCurrency: "NGN",
       }),
     ).rejects.toBeInstanceOf(RateUnavailableError);
+  });
+});
+
+describe("HttpJsonRateSource hardening", () => {
+  const SECRET_URL = "https://anchor.example/api/rates.json?apikey=TOPSECRET";
+  const hard = { jsonPath: "data.rate", anchorDomain: "anchor.example", targetCurrency: "NGN", url: SECRET_URL };
+
+  it("refuses redirects (the SSRF guard only vetted the configured URL) and sets a timeout signal", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ data: { rate: "1610" } }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await new HttpJsonRateSource(hard).rate(ARGS);
+    const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1];
+    expect(init.redirect).toBe("error");
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("turns a refused redirect into a generic error with no URL in it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError(`fetch failed: redirect to http://169.254.169.254/ from ${SECRET_URL}`);
+      }),
+    );
+    const err = await new HttpJsonRateSource(hard).rate(ARGS).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RateUnavailableError);
+    const msg = (err as Error).message;
+    expect(msg).not.toContain("TOPSECRET");
+    expect(msg).not.toContain("169.254");
+    expect(msg).not.toContain("anchor.example");
+  });
+
+  it("times out a hung endpoint instead of waiting forever", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init.signal!.addEventListener("abort", () => reject(init.signal!.reason));
+          }),
+      ),
+    );
+    await expect(new HttpJsonRateSource({ ...hard, timeoutMs: 25 }).rate(ARGS)).rejects.toBeInstanceOf(
+      RateUnavailableError,
+    );
+  });
+
+  it("refuses an oversize body declared by content-length", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ data: { rate: "1610" } }), {
+            status: 200,
+            headers: { "content-length": "999999" },
+          }),
+      ),
+    );
+    await expect(new HttpJsonRateSource({ ...hard, maxBodyBytes: 1024 }).rate(ARGS)).rejects.toThrow(
+      /exceeds 1024 bytes/,
+    );
+  });
+
+  it("refuses an oversize body that omits content-length", async () => {
+    const big = JSON.stringify({ data: { rate: "1610" }, pad: "x".repeat(5000) });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(big, { status: 200 })));
+    await expect(new HttpJsonRateSource({ ...hard, maxBodyBytes: 1024 }).rate(ARGS)).rejects.toThrow(
+      /exceeds 1024 bytes/,
+    );
+  });
+
+  it("does not leak the response body or the URL on a non-2xx", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("internal stack trace: db password=hunter2", { status: 500 })),
+    );
+    const warn = vi.fn();
+    const logger = { child: () => logger, warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() } as never;
+    const err = await new HttpJsonRateSource({ ...hard, logger }).rate(ARGS).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RateUnavailableError);
+    const msg = (err as Error).message;
+    expect(msg).toBe("rate endpoint returned HTTP 500");
+    expect(msg).not.toContain("hunter2");
+    expect(msg).not.toContain("TOPSECRET");
+    // Server-side only: the truncated body goes to the log, never the message.
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it("does not echo the URL when it is not a valid URL", () => {
+    let message = "";
+    try {
+      new HttpJsonRateSource({ ...hard, url: "not a url?apikey=TOPSECRET" });
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).not.toBe("");
+    expect(message).not.toContain("TOPSECRET");
   });
 });
 
